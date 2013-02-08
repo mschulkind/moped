@@ -12,6 +12,33 @@ module Moped
 
     attr_reader :host, :port, :timeout, :options
 
+    # Determine if the Connection is equal to another.
+    #
+    # @example Are the Connections equal?
+    #   connection == other
+    #
+    # @param [ Object ] other The other object.
+    #
+    # @return [ true, false ] If the Connection is equal to the other.
+    #
+    # @since 2.0.0
+    def ==(other)
+      address == other.address &&
+        timeout == other.timeout && options == other.options
+    end
+
+    # Get the address of the Connection in host:port format.
+    #
+    # @example Get the Connection address.
+    #   connection.address
+    #
+    # @return [ String ] The address of the Connection.
+    #
+    # @since 2.0.0
+    def address
+      @address ||= "#{host}:#{port}"
+    end
+
     # Is the connection alive?
     #
     # @example Is the connection alive?
