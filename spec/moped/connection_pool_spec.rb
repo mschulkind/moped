@@ -8,8 +8,14 @@ describe Moped::ConnectionPool do
       described_class.new
     end
 
+    let(:thread_id) do
+      Thread.current.object_id
+    end
+
     let(:connection) do
-      Moped::Connection.new("127.0.0.1", 27017, 5)
+      Moped::Connection.new("127.0.0.1", 27017, 5).tap do |conn|
+        conn.pin_to(thread_id)
+      end
     end
 
     context "when the connection is not in the pool" do
@@ -18,10 +24,16 @@ describe Moped::ConnectionPool do
         pool.checkin(connection)
       end
 
+      let(:connections) do
+        pool.send(:connections)
+      end
+
       it "adds the connection to the pool" do
-        expect(pool.send(:connections)).to eq(
-          { "127.0.0.1:27017" => [ connection ] }
-        )
+        expect(connections.get("127.0.0.1:27017").get(thread_id)).to eq(connection)
+      end
+
+      it "adds the exact instance to the pool" do
+        expect(connections.get("127.0.0.1:27017").get(thread_id)).to eql(connection)
       end
     end
   end
@@ -48,8 +60,12 @@ describe Moped::ConnectionPool do
           pool.checkout(thread_id, connection.address)
         end
 
-        it "returns an available connection" do
+        it "returns a new connection" do
           expect(checked_out).to eq(connection)
+        end
+
+        it "pins the connection to the provided thread_id" do
+          expect(checked_out.pinned_to).to eq(thread_id)
         end
 
         it "returns a new instance" do
@@ -104,12 +120,13 @@ describe Moped::ConnectionPool do
 
     context "when the pool has available connections for the thread" do
 
-      before do
-        pool.checkin(connection)
-      end
-
       let(:thread_id) do
         Thread.current.object_id
+      end
+
+      before do
+        connection.pin_to(thread_id)
+        pool.checkin(connection)
       end
 
       let(:checked_out) do
@@ -185,6 +202,42 @@ describe Moped::ConnectionPool do
       it "returns true" do
         expect(pool).to be_saturated
       end
+    end
+  end
+
+  describe "#unpin_connections" do
+
+    let(:pool) do
+      described_class.new
+    end
+
+    let(:thread_id) do
+      Thread.current.object_id
+    end
+
+    let(:address) do
+      "127.0.0.1:27017"
+    end
+
+    let(:connection) do
+      Moped::Connection.new("127.0.0.1", 27017, 5)
+    end
+
+    before do
+      connection.pin_to(thread_id)
+      pool.checkin(connection)
+    end
+
+    let!(:unpinned) do
+      pool.unpin_connections(thread_id)
+    end
+
+    it "unpins associated connections from the thread" do
+      expect(connection).to_not be_pinned
+    end
+
+    it "returns the connection pool" do
+      expect(unpinned).to eq(pool)
     end
   end
 end

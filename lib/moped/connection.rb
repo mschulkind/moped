@@ -10,7 +10,7 @@ module Moped
   # @api private
   class Connection
 
-    attr_reader :host, :port, :timeout, :options
+    attr_reader :host, :port, :timeout, :options, :pinned_to
 
     # Determine if the Connection is equal to another.
     #
@@ -110,6 +110,30 @@ module Moped
       @sock = nil
       @request_id = 0
       @host, @port, @timeout, @options = host, port, timeout, options
+    end
+
+    # Pin the Connection to a specific thread instance. We pin to the object_id
+    # of the Thread instead of the instance itself so the Thread can be garbage
+    # collected if terminated.
+    #
+    # @example Pin the Connection to a thread.
+    #   connection.pin_to(thread.object_id)
+    #
+    # @param [ Integer ] The instance object_id of the Thread.
+    #
+    # @return [ Integer ] The instance object_id of the Thread.
+    #
+    # @since 2.0.0
+    def pin_to(thread_id)
+      @pinned_to = thread_id
+    end
+
+    def pinned?
+      !!@pinned_to
+    end
+
+    def unpin
+      @pinned_to = nil
     end
 
     # Read from the connection.

@@ -6,28 +6,15 @@ module Moped
   # are always used for the same address. It also attempts to ensure that the
   # same thread would always get the same connection, but in rare cases this is
   # not guaranteed, for example if there are more threads than the maximum
-  # connection pool size.
+  # connection pool size or threads are hanging around that have not been
+  # garbage collected. For this purpose it is always recommended to have a
+  # higher pool size than thread count.
   #
   # @since 2.0.0
   class ConnectionPool
 
     # The default maximum number of Connections is 5.
     MAX_SIZE = 5
-
-    # Instantiate the new ConnectionPool.
-    #
-    # @example Instantiate the new pool.
-    #   Moped::ConnectionPool.new(max_size: 10)
-    #
-    # @param [ Hash ] options The ConnectionPool options.
-    #
-    # @option options [ Integer ] :max_size The maximum number of Connections.
-    #
-    # @since 2.0.0
-    def initialize(options = {})
-      @mutex, @resource = Mutex.new, ConditionVariable.new
-      @connections, @instantiated, @options = {}, 0, options
-    end
 
     # Check a Connection back into the ConnectionPool.
     #
@@ -41,8 +28,7 @@ module Moped
     # @since 2.0.0
     def checkin(connection)
       mutex.synchronize do
-        conns = connections[connection.address] ||= []
-        conns.push(connection)
+        connections.get(connection.address).set(connection)
         resource.broadcast and self
       end
     end
@@ -64,14 +50,29 @@ module Moped
     # @since 2.0.0
     def checkout(thread_id, address, timeout = 0.25)
       mutex.synchronize do
-        conns = connections.fetch(address, [])
-        return conns.first unless conns.empty?
+        connection = connections.get(address).get(thread_id)
+        return connection if connection
         if saturated?
-          wait_for_available(address, Time.now + timeout)
+          wait_for_available(thread_id, address, Time.now + timeout)
         else
           create_connection(thread_id, address)
         end
       end
+    end
+
+    # Instantiate the new ConnectionPool.
+    #
+    # @example Instantiate the new pool.
+    #   Moped::ConnectionPool.new(max_size: 10)
+    #
+    # @param [ Hash ] options The ConnectionPool options.
+    #
+    # @option options [ Integer ] :max_size The maximum number of Connections.
+    #
+    # @since 2.0.0
+    def initialize(options = {})
+      @mutex, @resource = Mutex.new, ConditionVariable.new
+      @connections, @instantiated, @options = Connections.new, 0, options
     end
 
     # Get the maximum number of Connections that are allowed in the pool.
@@ -97,6 +98,21 @@ module Moped
     # @since 2.0.0
     def saturated?
       instantiated >= max_size
+    end
+
+    # Unpins all the Connections that are currently pinned to the provided
+    # thread id.
+    #
+    # @example Unpin the Connections.
+    #   connection_pool.unpin_connections(13200001)
+    #
+    # @param [ Integer ] thread_id The instance object id of the Thread.
+    #
+    # @return [ Moped::ConnectionPool ] The ConnectionPool.
+    #
+    # @since 2.0.0
+    def unpin_connections(thread_id)
+      connections.unpin(thread_id) and self
     end
 
     # Raised when the maximum number of Connections in the pool has been
@@ -151,6 +167,7 @@ module Moped
     def create_connection(thread_id, address)
       host, port = address.split(":")
       connection = Connection.new(host, port.to_i, options[:timeout], {})
+      connection.pin_to(thread_id)
       @instantiated += 1
       connection
     end
@@ -169,13 +186,167 @@ module Moped
     # @return [ Moped::Connection ] The next available Connection.
     #
     # @since 2.0.0
-    def wait_for_available(address, deadline)
+    def wait_for_available(thread_id, address, deadline)
       loop do
-        conns = connections.fetch(address, [])
-        return conns.first unless conns.empty?
+        connection = connections.get(address).get(thread_id)
+        return connection if connection
         wait = deadline - Time.now
         raise MaxReached.new if wait <= 0
         resource.wait(mutex, wait)
+      end
+    end
+
+    # This inner class wraps all the Connections in the ConnectionPool and
+    # provides convenience access to those Connections.
+    #
+    # @since 2.0.0
+    class Connections
+
+      # Get the Pinning for the provided address.
+      #
+      # @example Get the Pinning.
+      #   connections.get("127.0.0.1:27017")
+      #
+      # @param [ String ] address The address in host:port form.
+      #
+      # @return [ Pinning ] The Pinning for the address.
+      #
+      # @since 2.0.0
+      def get(address)
+        pinnings[address] ||= Pinning.new
+      end
+
+      # Instantiate the new Connections object.
+      #
+      # @example Instantiate the Connections.
+      #   Connections.new
+      #
+      # @param [ Hash<Integer, Pinning> ] pinnings The Connection pinnings.
+      #
+      # @since 2.0.0
+      def initialize(pinnings = {})
+        @pinnings = pinnings
+      end
+
+      # Unpin all Connections for the provided thread id.
+      #
+      # @example Unpin all the Connections.
+      #   connections.unpin(1231000001)
+      #
+      # @param [ Integer ] thread_id The thread id to unpin for.
+      #
+      # @return [ Array<Pinning> ] The Pinnings.
+      #
+      # @since 2.0.0
+      def unpin(thread_id)
+        pinnings.values.each do |pinning|
+          pinning.unpin(thread_id)
+        end
+      end
+
+      private
+
+      # @!attribute pinnings
+      #   @api private
+      #   @return [ Hash<String, Pinning> ] The Connection pinnings.
+      #   @since 2.0.0
+      attr_reader :pinnings
+
+      # A Pinning represents a collection of thread_ids and their corresponding
+      # pinned Connections.
+      #
+      # @since 2.0.0
+      class Pinning
+
+        # Get a Connection for the provided thread id. If none is available,
+        # then we take an instantiated unpinned Connection.
+        #
+        # @example Get a Connection for the thread.
+        #   pinning.get(1231000001)
+        #
+        # @param [ Integer ] thread_id The object_id of the Thread.
+        #
+        # @return [ Connection ] The pinned Connection.
+        def get(thread_id)
+          threads[thread_id] ||= next_unpinned(thread_id)
+        end
+
+        # Instantiate a new Pinning.
+        #
+        # @example Instantiate a new Pinning.
+        #   Pinning.new
+        #
+        # @param [ Hash<Integer, Connection> ] threads The thread pinnings.
+        # @param [ Array<Connection> ] unpinned A collection of unpinned
+        #   Connections.
+        #
+        # @since 2.0.0
+        def initialize(threads = {}, unpinned = [])
+          @threads, @unpinned = threads, unpinned
+        end
+
+        # Set a Connection in the Pinning.
+        #
+        # @example Set the Connection.
+        #   pinning.set(connection)
+        #
+        # @param [ Moped::Connection ] connection The Connection to set.
+        #
+        # @return [ Moped::Connection ] The Connection.
+        #
+        # @since 2.0.0
+        def set(connection)
+          threads[connection.pinned_to] = connection
+        end
+
+        # Unpin a Connection from the provided thread id.
+        #
+        # @example Unpin from the Thread.
+        #   pinning.unpin(13201110111)
+        #
+        # @param [ Integer ] thread_id The Thread's object_id.
+        #
+        # @return [ Array<Connection> ] All the unpinned Connections.
+        #
+        # @since 2.0.0
+        def unpin(thread_id)
+          connection = threads.delete(thread_id)
+          connection.unpin
+          unpinned.push(connection)
+        end
+
+        private
+
+        # @!attribute threads
+        #   @api private
+        #   @return [ Hash<Integer, Connection> ] The Connection pinnings.
+        #   @since 2.0.0
+        #
+        # @!attribute unpinned
+        #   @api private
+        #   @return [ Array<Connection> ] Instantiated Connections that are not
+        #     pinned.
+        #   @since 2.0.0
+        attr_reader :threads, :unpinned
+
+        # Get an unpinned thread, pin it to the provided Thread id, and return
+        # it.
+        #
+        # @api private
+        #
+        # @example Get the next unpinned Connection.
+        #   pinning.nex_unpinned(11130000011)
+        #
+        # @param [ Integer ] thread_id The object_id of the Thread.
+        #
+        # @return [ Connection ] The next Connection.
+        #
+        # @since 2.0.0
+        def next_unpinned(thread_id)
+          connection = unpinned.pop
+          connection.pin_to(thread_id) if connection
+          connection
+        end
       end
     end
   end
