@@ -268,7 +268,7 @@ module Moped
         #
         # @return [ Connection ] The pinned Connection.
         def get(thread_id)
-          threads[thread_id] ||= next_unpinned(thread_id)
+          threads.delete(thread_id) || next_unpinned(thread_id)
         end
 
         # Instantiate a new Pinning.

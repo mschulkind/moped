@@ -129,8 +129,12 @@ describe Moped::ConnectionPool do
         pool.checkin(connection)
       end
 
-      let(:checked_out) do
+      let!(:checked_out) do
         pool.checkout(thread_id, connection.address)
+      end
+
+      let(:pinnings) do
+        pool.send(:connections).get(connection.address).send(:threads)
       end
 
       it "returns an available connection" do
@@ -139,6 +143,10 @@ describe Moped::ConnectionPool do
 
       it "returns the available instance" do
         expect(checked_out).to eql(connection)
+      end
+
+      it "removes the instance from the connections" do
+        expect(pinnings).to be_empty
       end
     end
   end
